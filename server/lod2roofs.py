@@ -12,6 +12,7 @@ roof:shape or height is kept. Outside the countries' boxes, where a shard is mis
 predicted roofs. The sources and their licences are in CREDITS.md; each country's credit shows near its shards.
 
   BNE_LOD2_ROOFS=off   no measured roofs
+  BNE_PL_LOD2=1        also Poland's (GUGiK's LoD2 models, folder lod2-pl; opt-in: docs/POLAND_LOD2.md)
   BNE_LOD2_DIR         a local folder with <dir>/<folder>/<x>/<y>.npz instead of the site (testing a build before it
                        is published); nothing is fetched then
 """
@@ -28,12 +29,14 @@ import numpy as np
 import dmath
 
 import netfetch
+import polandlod1
 import railtags
 from polygon import Path
 
 log = logging.getLogger("earthd.lod2roofs")
 
 ON = os.environ.get("BNE_LOD2_ROOFS", "on") != "off"
+PL_ON = os.environ.get("BNE_PL_LOD2", "").strip().lower() in ("1", "true", "yes", "on")
 ZOOM = 10
 RETRY_S = 3600                  # unreachable: asked again after this long
 CELL_M = 32.0                   # the grid a tile's records are looked up in
@@ -48,6 +51,8 @@ SOURCES = (
     Country("ee", "lod2-ee", (57.45, 21.6, 59.85, 28.25), "roof:lod2-ee"),    # Estonia
     Country("wien", "lod2-wien", (48.11, 16.17, 48.33, 16.58), "roof:lod2-wien"),   # Vienna (the city's roof model)
 )
+if PL_ON:                       # (opt-in, until its shards are published: without it nothing here changes)
+    SOURCES += (Country("pl", "lod2-pl", (49.0, 14.1, 54.9, 24.2), "roof:lod2-pl"),)     # GUGiK, 10 voivodeships
 BOX = SOURCES[0].box            # (Germany's: kept for callers that ask for it)
 # AdV roofType -> roof:shape. 5000 (mixed), 9999 (other) and an empty code say nothing about the shape: predicted.
 SHAPES = {1000: "flat", 2100: "skillion", 2200: "skillion", 3100: "gabled", 3200: "hipped", 3300: "half-hipped",
@@ -112,8 +117,9 @@ class Source:
         self.dir = os.path.join(cache_dir, "pagesdata", "lod2") if cache_dir else None     # (Germany's folder)
         self.fetcher = fetcher
         self.lock = threading.Lock()
-        self.shards = {}            # (folder, x, y) -> {lat, lon, code, height, roof} arrays, or {} none there
-        self.down_at = 0.0
+        self.shards = {}            # (folder, x, y) -> {lat, lon, code, height, roof, ridge, src}, or {} none there
+        self.down_at = {}           # folder -> when it was last unreachable (one folder not published, a missing
+                                    # lod2-pl, must not stop the other countries' roofs)
         self.sites = {}             # folder -> railtags.Shards: its manifest (pinned, refreshed daily), its "data" host
 
     def _site(self, folder):
@@ -139,6 +145,8 @@ class Source:
             if body is None:
                 return {}
         got = decode(body)
+        if got:
+            got["src"] = next((c.key for c in SOURCES if c.folder == folder), folder)
         with self.lock:
             self.shards[(folder, x, y)] = got
         return got
@@ -157,7 +165,7 @@ class Source:
                         return fh.read()
             except OSError:
                 pass
-        if self.fetcher is None or time.time() - self.down_at < RETRY_S:
+        if self.fetcher is None or time.time() - self.down_at.get(folder, 0.0) < RETRY_S:
             return None
         try:
             # (the folder's manifest names the host of its shards, data_url: R2 behind the CDN; none had (offline,
@@ -169,7 +177,7 @@ class Source:
             body = b""
         except Exception as e:      # (offline, or not published: the predicted roofs)
             log.debug("lod2 shard %s %s %s: %s: %s", folder, x, y, type(e).__name__, e)
-            self.down_at = time.time()
+            self.down_at[folder] = time.time()
             return None
         if path:
             os.makedirs(d, exist_ok=True)
@@ -194,15 +202,22 @@ class Source:
         return Records(frame, shards, x0 - m, y0 - m, x1 + m, y1 + m)
 
 
+NO_RIDGE = 255          # a shard's ridge value for none (tools/build_lod2_roofs.NO_RIDGE)
+
+
 def decode(body):
-    """The arrays of a shard's bytes ({} empty or unreadable)."""
+    """The arrays of a shard's bytes ({} empty or unreadable). ridge: the ridge's azimuth in degrees clockwise from true
+    north, 0..179, NaN where there is none; a shard built before the field has none at all."""
     if not body:
         return {}
     try:
         with np.load(io.BytesIO(body), allow_pickle=False) as z:
-            return {"lat": z["lat"].astype(np.float64) / 1e6, "lon": z["lon"].astype(np.float64) / 1e6,
-                    "code": z["code"].astype(np.int32), "height": z["height"].astype(np.float32) / 10.0,
-                    "roof": z["roof"].astype(np.float32) / 10.0}
+            out = {"lat": z["lat"].astype(np.float64) / 1e6, "lon": z["lon"].astype(np.float64) / 1e6,
+                   "code": z["code"].astype(np.int32), "height": z["height"].astype(np.float32) / 10.0,
+                   "roof": z["roof"].astype(np.float32) / 10.0}
+            r = z["ridge"] if "ridge" in z.files else np.full(len(out["lat"]), NO_RIDGE, np.uint8)
+            out["ridge"] = np.where(r < 180, r, np.nan).astype(np.float32)
+            return out
     except (OSError, ValueError, KeyError, EOFError, zipfile.BadZipFile) as e:   # (EOFError: empty, BadZipFile: cut short)
         log.warning("lod2 shard unreadable: %s", e)
         return {}
@@ -212,7 +227,7 @@ class Records:
     """A tile's records in its frame, found by the footprint they stand in."""
 
     def __init__(self, frame, shards, x0, y0, x1, y1):
-        e, n, code, height, roof = [], [], [], [], []
+        e, n, code, height, roof, ridge, pl = [], [], [], [], [], [], []
         for s in shards:
             k = (s["lat"] > -90.0)
             ee, nn, _ = frame.geodetic_to_enu(s["lat"][k], s["lon"][k], 0.0)
@@ -222,8 +237,11 @@ class Records:
             code.append(s["code"][k][keep])
             height.append(s["height"][k][keep])
             roof.append(s["roof"][k][keep])
+            ridge.append(s["ridge"][k][keep] if "ridge" in s else np.full(int(keep.sum()), np.nan, np.float32))
+            pl.append(np.full(int(keep.sum()), s.get("src") == "pl"))
         self.e, self.n = np.concatenate(e), np.concatenate(n)
         self.code, self.height, self.roof = np.concatenate(code), np.concatenate(height), np.concatenate(roof)
+        self.ridge, self.pl = np.concatenate(ridge), np.concatenate(pl)
         self.grid = {}
         for i, key in enumerate(zip((self.e // CELL_M).astype(np.int64).tolist(),
                                     (self.n // CELL_M).astype(np.int64).tolist())):
@@ -260,9 +278,22 @@ class Records:
             at["roof_shape"] = shape
             if self.roof[i] > 0 and not _known(at.get("roof_height")):
                 at["roof_height"] = float(self.roof[i])
-        if self.height[i] > 0 and not _known(at.get("height")):
+        if self.height[i] > 0 and (not _known(at.get("height")) or self._replaces(i, at)):
             at["height"] = float(self.height[i])
+        if shape in RIDGED and np.isfinite(self.ridge[i]) and not _known(at.get("roof_direction")):
+            # (roof_direction is the compass direction a slope faces, buildings.ridge_frame: the ridge runs across it,
+            # so the ridge's azimuth + 90. Not for a skillion: there it also names the high side, which a ridge does
+            # not say, so it stays the plan's own; not for a pyramid, which has no ridge to follow)
+            at["roof_direction"] = float((self.ridge[i] + 90.0) % 360.0)
         return at
+
+    def _replaces(self, i, at):
+        """Poland's LoD2 height (2017, the roof's own top) replaces the height of a LOD1 building (GUGiK 2024; the
+        product owner's call: LoD2 wins there); any other building's own height stays."""
+        return bool(self.pl[i]) and str(at.get("src_dataset")) == polandlod1.DATASET
+
+
+RIDGED = {"gabled", "hipped", "half-hipped", "mansard", "round"}      # (the shapes whose slopes face across a ridge)
 
 
 def _known(v):

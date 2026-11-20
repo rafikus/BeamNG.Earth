@@ -5022,7 +5022,7 @@ def tile_buildings(frame, x0, y0, x1, y1, layers, elev, water=None, part_layers=
             at = {k: (a[k][i] if k in a else None) for k in
                   ("class", "subtype", "height", "num_floors", "min_height", "roof_shape", "roof_height", "name",
                    "facade_material", "facade_color", "roof_material", "roof_color", "roof_orientation",
-                   "roof_direction", "height_src", "roof_rise")}
+                   "roof_direction", "height_src", "roof_rise", "src_dataset")}   # (src_dataset: lod2roofs.fill)
             if row_cols is not None and row_cols[i] != (None, None):
                 at = osmcolours.fill_from(at, row_cols[i])
             if key is not None:         # (plan's random choices keyed on the feature, not where the anchor puts it)

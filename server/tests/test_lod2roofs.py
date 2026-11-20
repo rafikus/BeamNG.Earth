@@ -1,11 +1,13 @@
 import os
 """lod2roofs: a measured record fills what the map leaves out of the footprint it stands in; the map's own values stay,
 nothing is asked for outside Germany, and a missing shard means the predicted roofs."""
+import importlib
 import io
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -14,17 +16,20 @@ import buildings as bld  # noqa: E402
 import geodesy  # noqa: E402
 import lod2roofs as lr  # noqa: E402
 import netfetch  # noqa: E402
+import polandlod1  # noqa: E402
 
 LAT, LON = 50.9, 9.1
 
 
-def shard(rows):
-    """npz bytes of [(lat, lon, code, height m, roof m)]."""
+def shard(rows, ridge=None):
+    """npz bytes of [(lat, lon, code, height m, roof m)]; ridge: [degrees true 0..179 or None] per row (a shard
+    without the field, as published before it, when not given)."""
     a = np.array(rows, np.float64)
     buf = io.BytesIO()
+    extra = {} if ridge is None else {"ridge": np.array([255 if r is None else r for r in ridge], np.uint8)}
     np.savez_compressed(buf, lat=np.round(a[:, 0] * 1e6).astype(np.int32), lon=np.round(a[:, 1] * 1e6).astype(np.int32),
                         code=a[:, 2].astype(np.int16), height=np.round(a[:, 3] * 10).astype(np.uint16),
-                        roof=np.round(a[:, 4] * 10).astype(np.uint16))
+                        roof=np.round(a[:, 4] * 10).astype(np.uint16), **extra)
     return buf.getvalue()
 
 
@@ -255,3 +260,142 @@ class CountriesTest(unittest.TestCase):
             self.assertIn(c.credit, credits.ORDER)
         self.assertIn("swisstopo", credits.full_label("roof:lod2-ch"))
         self.assertIn("Land and Spatial Development Board", credits.full_label("roof:lod2-ee"))
+
+
+PL_LAT, PL_LON = 51.77695, 19.45468     # (Lodz)
+GORLITZ = (51.15, 14.99)                # (Germany's and Poland's boxes overlap here)
+
+
+class PolandCase(unittest.TestCase):
+    """BNE_PL_LOD2=1 for the test: lod2roofs re-read with it, and again without it afterwards."""
+
+    def setUp(self):
+        p = mock.patch.dict("os.environ", {"BNE_PL_LOD2": "1"})
+        p.start()
+        importlib.reload(lr)
+
+        def restore():
+            p.stop()
+            importlib.reload(lr)
+        self.addCleanup(restore)
+
+    def records(self, rows, ridge=None, lat=PL_LAT, lon=PL_LON):
+        src = lr.Source(None, Fetcher(shard(rows, ridge)))
+        return src.tile(geodesy.EnuFrame(lat, lon), -200, -200, 200, 200), src
+
+
+class PolandSwitchTest(unittest.TestCase):
+    def tearDown(self):
+        importlib.reload(lr)
+
+    def test_unset_changes_nothing(self):
+        with mock.patch.dict("os.environ", clear=False):
+            os.environ.pop("BNE_PL_LOD2", None)
+            importlib.reload(lr)
+            self.assertEqual([c.key for c in lr.SOURCES], ["de", "ch", "ee", "wien"])
+            f = Fetcher(error=netfetch.NotFound("none"))
+            self.assertIsNone(lr.Source(None, f).tile(geodesy.EnuFrame(PL_LAT, PL_LON), -200, -200, 200, 200))
+            self.assertEqual(f.urls, [])        # (Poland: nothing asked for)
+
+    def test_set_adds_poland(self):
+        with mock.patch.dict("os.environ", {"BNE_PL_LOD2": "1"}):
+            importlib.reload(lr)
+            self.assertEqual([c.key for c in lr.SOURCES], ["de", "ch", "ee", "wien", "pl"])
+            pl = lr.SOURCES[-1]
+            self.assertEqual((pl.folder, pl.credit), ("lod2-pl", "roof:lod2-pl"))
+            import credits
+            self.assertIn("roof:lod2-pl", credits.ORDER)
+            self.assertIn("GUGiK", credits.full_label("roof:lod2-pl"))
+            f = Fetcher(error=netfetch.NotFound("none"))
+            lr.Source(None, f).tile(geodesy.EnuFrame(PL_LAT, PL_LON), -200, -200, 200, 200)
+            self.assertEqual({u.split(f"{lr.railtags.PAGES}/", 1)[1].split("/")[0] for u in f.urls}, {"lod2-pl"})
+
+
+class PolandHeightTest(PolandCase):
+    def test_lod2_height_replaces_a_lod1_buildings(self):
+        rec, _ = self.records([(PL_LAT, PL_LON, 3100, 9.4, 3.2)])
+        at = rec.fill({"src_dataset": polandlod1.DATASET, "height": 6.0, "roof_shape": None}, *ring(0, 0))
+        self.assertAlmostEqual(at["height"], 9.4, 3)
+        self.assertEqual(at["roof_shape"], "gabled")
+
+    def test_an_overture_buildings_own_height_stays(self):
+        rec, _ = self.records([(PL_LAT, PL_LON, 3100, 9.4, 3.2)])
+        at = rec.fill({"src_dataset": "OpenStreetMap", "height": 6.0, "roof_shape": None}, *ring(0, 0))
+        self.assertEqual(at["height"], 6.0)
+        self.assertEqual(at["roof_shape"], "gabled")
+        at = rec.fill({"src_dataset": "Microsoft ML Buildings", "height": None}, *ring(0, 0))
+        self.assertAlmostEqual(at["height"], 9.4, 3)         # (none to keep: filled, as ever)
+
+    def test_only_polands_records_replace(self):
+        """A German record on a building that says it is LOD1 (it cannot be, but the rule is the source's)."""
+        src = lr.Source(None, Fetcher(shard([(LAT, LON, 3100, 9.4, 3.2)])))
+        rec = src.tile(geodesy.EnuFrame(LAT, LON), -200, -200, 200, 200)
+        at = rec.fill({"src_dataset": polandlod1.DATASET, "height": 6.0}, *ring(0, 0))
+        self.assertEqual(at["height"], 6.0)
+
+    def test_buildings_carries_src_dataset_to_fill(self):
+        import inspect
+        self.assertIn('"src_dataset"', inspect.getsource(bld.tile_buildings))
+
+
+class RidgeTest(PolandCase):
+    def test_a_ridge_gives_the_slope_direction_across_it(self):
+        rec, _ = self.records([(PL_LAT, PL_LON, 3100, 9.0, 3.0)], [30])
+        at = rec.fill({"roof_shape": None, "height": None}, *ring(0, 0))
+        self.assertEqual(at["roof_direction"], 120.0)
+        rec, _ = self.records([(PL_LAT, PL_LON, 3200, 9.0, 3.0)], [170])
+        self.assertEqual(rec.fill({"roof_shape": None}, *ring(0, 0))["roof_direction"], 260.0)   # (170 + 90) % 360
+
+    def test_a_known_direction_stays(self):
+        rec, _ = self.records([(PL_LAT, PL_LON, 3100, 9.0, 3.0)], [30])
+        at = rec.fill({"roof_shape": None, "roof_direction": 45.0}, *ring(0, 0))
+        self.assertEqual(at["roof_direction"], 45.0)
+
+    def test_none_for_flat_skillion_pyramid_dome_or_no_ridge(self):
+        for code in (1000, 2100, 3500, 3700):
+            rec, _ = self.records([(PL_LAT, PL_LON, code, 9.0, 3.0)], [30])
+            self.assertIsNone(rec.fill({"roof_shape": None}, *ring(0, 0)).get("roof_direction"), code)
+        rec, _ = self.records([(PL_LAT, PL_LON, 3100, 9.0, 3.0)], [None])
+        self.assertIsNone(rec.fill({"roof_shape": None}, *ring(0, 0)).get("roof_direction"))
+
+    def test_a_mapped_shape_with_no_direction_gets_the_ridge_too(self):
+        rec, _ = self.records([(PL_LAT, PL_LON, 3100, 9.0, 3.0)], [90])
+        at = rec.fill({"roof_shape": "gabled", "height": 7.0}, *ring(0, 0))
+        self.assertEqual(at["roof_direction"], 180.0)
+
+    def test_a_shard_without_the_field_still_decodes(self):
+        d = lr.decode(shard([(LAT, LON, 3100, 9.0, 3.0)]))
+        self.assertEqual(len(d["lat"]), 1)
+        self.assertTrue(np.isnan(d["ridge"]).all())
+        rec, _ = self.records([(PL_LAT, PL_LON, 3100, 9.0, 3.0)])
+        at = rec.fill({"roof_shape": None}, *ring(0, 0))
+        self.assertEqual(at["roof_shape"], "gabled")
+        self.assertIsNone(at.get("roof_direction"))
+
+    def test_the_ridge_round_trips(self):
+        row = (LAT, LON, 3100, 9.0, 3.0)
+        d = lr.decode(shard([row, row, row], [0, 179, None]))
+        self.assertEqual(d["ridge"][:2].tolist(), [0.0, 179.0])
+        self.assertTrue(np.isnan(d["ridge"][2]))
+
+
+class FolderRetryTest(PolandCase):
+    def test_a_folder_that_fails_does_not_stop_the_others(self):
+        body = shard([(GORLITZ[0], GORLITZ[1], 3100, 9.0, 3.0)])
+
+        class Half(Fetcher):
+            def get(self, url, kind="demand", **_):
+                self.urls.append(url)
+                if "/lod2-pl/" in url:
+                    raise OSError("not published")
+                return Body(body)
+        f = Half()
+        src = lr.Source(None, f)
+        frame = geodesy.EnuFrame(*GORLITZ)
+        rec = src.tile(frame, -200, -200, 200, 200)
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec.fill({"roof_shape": None}, *ring(0, 0))["roof_shape"], "gabled")
+        self.assertEqual(set(src.down_at), {"lod2-pl"})
+        asked = len([u for u in f.urls if "/lod2-pl/" in u])
+        src.tile(frame, -200, -200, 200, 200)
+        self.assertEqual(len([u for u in f.urls if "/lod2-pl/" in u]), asked, "the failing folder waits its RETRY_S")

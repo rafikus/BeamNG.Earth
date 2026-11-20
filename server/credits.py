@@ -122,6 +122,7 @@ FEATURES = {
     "roof:lod2-ch": "swisstopo (swissBUILDINGS3D)",
     "roof:lod2-ee": "Estonian Land and Spatial Development Board",
     "roof:lod2-wien": "Stadt Wien (data.wien.gv.at)",
+    "roof:lod2-pl": "GUGiK (LoD2 building models)",
     "roof:3dbag": "3DBAG (tudelft3d, 3DGI)",
     "bld:bdtopo-fr": "IGN BD TOPO",
     "bld:nyc-3d": "NYC 3-D Building Model (OTI)",
@@ -153,6 +154,8 @@ LONG = {
                     "faces, data changed",
     "roof:lod2-wien": "Roof shapes and heights in Vienna: Datenquelle: Stadt Wien - data.wien.gv.at (Generalisiertes "
                       "Dachmodell LOD2.1, CC BY 4.0), data changed",
+    "roof:lod2-pl": "Roof shapes and heights in Poland: Źródło: GUGiK (Head Office of Geodesy and "
+                    "Cartography), LoD2 3D building models 2017 (CC BY 4.0), data changed",
 }
 SHORT.update(FEATURES)
 GROUPS = [("img", "Imagery", "Far imagery"), ("dem", "Elevation", "Far elevation"), ("map", "Map", "Far map"),
