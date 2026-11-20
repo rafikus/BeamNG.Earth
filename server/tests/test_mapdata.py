@@ -906,10 +906,10 @@ class CacheTest(Sources, SmallBlocks, unittest.TestCase):
         builds = []
         real = mapdata.MapData._build
 
-        def slow(self_, key, layer, kind):
+        def slow(self_, key, layer, kind, lod1=None):      # (lod1: polandlod1's selection, PR #1247)
             builds.append(layer)
             time.sleep(0.3)
-            return real(self_, key, layer, kind)
+            return real(self_, key, layer, kind, lod1)
         out = {}
         with mock.patch.object(mapdata.MapData, "_build", slow):
             ta = threading.Thread(target=lambda: out.setdefault("a", md.cell(mf.CELL, ("roads",)).digest()))
