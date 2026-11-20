@@ -10,15 +10,18 @@ CityGML never lie on disk at once (rows: ~20 bytes; shards: ~6 bytes a building)
 
 Sources: the German states (two-letter codes: AdV CityGML with its roofType); CH (swissBUILDINGS3D 3.0, Switzerland and
 Liechtenstein: swisstopo's File Geodatabase per map sheet); EE (Estonia's LoD2 CityGML per municipality); WIEN
-(Vienna's generalised roof model, CityGML per 1:1000 sheet, roofType by name). Where a model has no roofType,
+(Vienna's generalised roof model, CityGML per 1:1000 sheet, roofType by name); PL (GUGiK's LoD2 models, CityGML per
+powiat, roofType in the CityGML codelist: PL_ROOF below turns it into the AdV code, and a "mixed" or "other" roof is
+read from its faces; BNE_LOD2_PL_POWIATS=1661,1261 limits it to those powiats). Where a model has no roofType,
 tools/lod2_classify.py reads the shape from the roof faces into the same AdV code. Each country's shards go to a
-folder of their own: lod2/ Germany, lod2-ch/, lod2-ee/, lod2-wien/ (server/lod2roofs.SOURCES).
+folder of their own: lod2/ Germany, lod2-ch/, lod2-ee/, lod2-wien/, lod2-pl/ (server/lod2roofs.SOURCES).
 
 The root is BNE_LOD2_ROOT. Niedersachsen's tile list is its index GeoJSON, saved as <root>/ni.geojson.
 Needs lxml and pyproj; CH also pyogrio (for the GDAL its wheel bundles). Licences and credits: CREDITS.md.
 """
 import csv
 import ctypes
+import functools
 import gzip
 import html
 import io
@@ -45,14 +48,20 @@ from lxml import etree
 from pyproj import Transformer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "server"))
 import lod2_classify  # noqa: E402
+import pl1992  # noqa: E402  (the project's rule: Polish coordinates go through it, not pyproj)
 
 ROOT = os.environ.get("BNE_LOD2_ROOT", "lod2")
 OUT = os.path.join(ROOT, "out")
 TMP = os.path.join(ROOT, "tmp")
 ZOOM = 10
 CHUNK = 1 << 20
-RECORD = np.dtype([("lat", "<i4"), ("lon", "<i4"), ("code", "<i2"), ("height", "<u2"), ("roof", "<u2")])
+# ridge: the ridge's azimuth in whole degrees 0..179 clockwise from true north, NO_RIDGE where there is none (shards
+# built before the field have no such array: server/lod2roofs.decode)
+NO_RIDGE = 255
+RECORD = np.dtype([("lat", "<i4"), ("lon", "<i4"), ("code", "<i2"), ("height", "<u2"), ("roof", "<u2"),
+                   ("ridge", "u1")])
 
 
 FIELDS = ("x", "y", "epsg", "area", "roof", "height", "z0", "zr", "zt", "ridge", "part")
@@ -122,10 +131,16 @@ ROOF_NAMES = {"FLACHDACH": 1000, "PULTDACH": 2100, "VERSETZTESPULTDACH": 2200, "
               "KRUEPPELWALMDACH": 3300, "KRÜPPELWALMDACH": 3300, "MANSARDDACH": 3400, "ZELTDACH": 3500,
               "KEGELDACH": 3600, "KUPPELDACH": 3700, "SHEDDACH": 3800, "BOGENDACH": 3900, "TONNENDACH": 3900,
               "TURMDACH": 4000, "SPITZDACH": 4000, "MISCHFORM": 5000, "SONSTIGES": 9999}
+# GUGiK's roofType is the CityGML / SIG3D codelist (1000 flat ... 1140 other), not the AdV one
+PL_ROOF = {1000: 1000, 1010: 2100, 1020: 2200, 1030: 3100, 1040: 3200, 1050: 3300, 1060: 3400, 1070: 3500, 1080: 3600,
+           1090: 3700, 1100: 3800, 1110: 3900, 1120: 4000, 1130: 5000, 1140: 9999}
+ROOF_CODES = {"PL": PL_ROOF}    # source -> its numeric roofType codes to the AdV code (the others give AdV already)
+READ_FACES = {"PL": {"5000", "9999"}}   # source -> the AdV codes that say nothing (mixed, other): read from the faces
 SKIP_KINDS = {"30", "40"}   # Estonia's tyyp: a foundation, a ruin (no roof to read)
 
 
-def row(el, epsg, part):
+def row(el, epsg, part, source=None):
+    codes, faces = ROOF_CODES.get(source), READ_FACES.get(source, ())
     roof = height = None
     ground, roofs, walls, untyped = [], [], [], False
     for e in el.iter():
@@ -134,7 +149,10 @@ def row(el, epsg, part):
             continue
         if n == "roofType" and e.text and roof is None:
             roof = e.text.strip()
-            roof = str(ROOF_NAMES.get(roof.upper(), roof)) if not roof.isdigit() else roof
+            if codes is not None:       # (this source's own codes: an unlisted one is no roofType)
+                roof = str(codes.get(int(roof), "")) if roof.isdigit() else str(ROOF_NAMES.get(roof.upper(), ""))
+            else:
+                roof = str(ROOF_NAMES.get(roof.upper(), roof)) if not roof.isdigit() else roof
         elif n == "measuredHeight" and e.text and height is None:
             try:
                 height = float(e.text)
@@ -158,15 +176,20 @@ def row(el, epsg, part):
     if epsg in NORTH_FIRST:
         ground, roofs, walls = ([[(p[1], p[0], p[2]) for p in r] for r in rs] for rs in (ground, roofs, walls))
     rise = None
-    if not roof and roofs:
+    if (not roof or roof in faces) and roofs:
         code, rise = lod2_classify.classify_rise(roofs)     # (no roofType: the shape read from the roof faces)
-        roof = str(code) if code else ""
+        if code:
+            roof = str(code)
+        elif roof:
+            rise = None         # (mixed, and the faces say nothing either: stays mixed, its height from the lowest face)
+        else:
+            roof = ""
     c = centroid(ground or roofs)
     if c is None:
         return None
     zs = [p[2] for r in ground for p in r] or [p[2] for r in walls for p in r]
     rz = [p[2] for r in roofs for p in r]
-    az = ridge(roofs)
+    az = None if roof == "1000" else ridge(roofs)      # (a flat roof's level edges are no ridge)
     zr = (max(rz) - rise if rise is not None else min(rz)) if rz else None    # (the roof height is zt - zr)
     out = {"x": round(c[0], 2), "y": round(c[1], 2), "epsg": epsg, "area": round(c[2], 1), "roof": roof or "",
            "height": "" if height is None else round(height, 2), "z0": round(min(zs), 2) if zs else "",
@@ -228,8 +251,8 @@ def clear(el):
         del el.getparent()[0]
 
 
-def parse(f, default_epsg=None):
-    """Rows of the CityGML file object f."""
+def parse(f, default_epsg=None, source=None):
+    """Rows of the CityGML file object f (source: its country's code tables, ROOF_CODES)."""
     epsg = default_epsg
     for _, el in etree.iterparse(f, events=("end",), huge_tree=True, recover=True):
         n = local(el.tag)
@@ -242,11 +265,11 @@ def parse(f, default_epsg=None):
             parts = [p for p in el.iter() if local(p.tag) == "BuildingPart"]
             if parts:
                 for p in parts:
-                    r = row(p, epsg, True)
+                    r = row(p, epsg, True, source)
                     if r:
                         yield r
             else:
-                r = row(el, epsg, False)
+                r = row(el, epsg, False, source)
                 if r:
                     yield r
             clear(el)
@@ -368,6 +391,8 @@ def jobs(state):
         sheets = sorted({f["properties"]["MZK1000"] for f in d["features"] if f["properties"].get("MZK1000")})
         return [(s, f"https://www.wien.gv.at/ma41datenviewer/downloads/geodaten/lod2_gml/{s}_lod2_gml.zip")
                 for s in sheets]
+    if state == "PL":
+        return pl_jobs()
     if state == "EE":
         page = "https://geoportaal.maaruum.ee/eng/Download-3D-data-p837.html"
         files = sorted(set(re.findall(r"f=(hooned_lod2-[^&\"']+-citygml\.zip)", text(page))))
@@ -377,6 +402,34 @@ def jobs(state):
 
 
 EE = "https://geoportaal.maaruum.ee/index.php"
+PL_LOD2 = "https://opendata.geoportal.gov.pl/InneDane/Budynki3D/LOD2/{teryt}_gml.zip"
+# the voivodeships (TERYT prefix) GUGiK has LoD2 models for (2017; łódzkie, 10, has none, nor have five others)
+PL_VOIVODESHIPS = {"04", "06", "12", "14", "16", "18", "20", "24", "26", "28"}
+
+
+def pl_index():
+    """The Polish LOD1 index (server/polandlod1.Manifest), whose file names start with their powiat's TERYT code:
+    BNE_LOD2_PL_INDEX, else the one the server keeps in its cache, else the pinned one from the dataset's repository."""
+    import hashlib
+    import polandlod1
+    cands = [os.environ.get("BNE_LOD2_PL_INDEX") or "",
+             os.path.join(os.path.expanduser("~"), ".cache", "beamng-earth", "polandlod1",
+                          f"index.{polandlod1.INDEX_SHA256[:16]}.npz")]
+    for p in cands:
+        if p and os.path.exists(p):
+            return polandlod1.Manifest(p)
+    body = get(polandlod1.INDEX_URL).read()
+    if hashlib.sha256(body).hexdigest() != polandlod1.INDEX_SHA256:
+        raise IOError("the Polish LOD1 index is not the pinned one")
+    return polandlod1.Manifest(io.BytesIO(body))
+
+
+def pl_jobs():
+    """(TERYT, url) of every powiat of the voivodeships with LoD2 (a powiat without a model answers 404: work() counts
+    it empty); BNE_LOD2_PL_POWIATS=1661,1261 only those."""
+    only = {c.strip() for c in os.environ.get("BNE_LOD2_PL_POWIATS", "").split(",") if c.strip()}
+    codes = sorted({n[:4] for n in pl_index().names if n[:2] in PL_VOIVODESHIPS})
+    return [(c, PL_LOD2.format(teryt=c)) for c in codes if not only or c in only]
 STAC = "https://data.geo.admin.ch/api/stac/v0.9/collections/ch.swisstopo.swissbuildings3d_3_0/items"
 
 
@@ -481,13 +534,13 @@ def _num(s):
         return float("nan")
 
 
-def rows_of(path, name, depth=0):
+def rows_of(path, name, depth=0, source=None):
     """Rows of a GML, or of every GML in a ZIP (and in ZIPs inside it)."""
     with open(path, "rb") as f:
         head = f.read(4)
     if head[:2] != b"PK":
         with open(path, "rb") as f:
-            yield from parse(f)
+            yield from parse(f, None, source)
         return
     with zipfile.ZipFile(path) as z:
         gdbs = sorted({n.split(".gdb/")[0] + ".gdb" for n in z.namelist() if ".gdb/" in n})
@@ -510,15 +563,15 @@ def rows_of(path, name, depth=0):
                     while b := i.read(1 << 20):
                         o.write(b)
                 try:
-                    yield from rows_of(p, n, depth + 1)
+                    yield from rows_of(p, n, depth + 1, source)
                 finally:
                     os.remove(p)
             elif low.endswith((".gml", ".xml")) and "meta" not in low:
                 with z.open(n) as f:
-                    yield from parse(f)
+                    yield from parse(f, None, source)
 
 
-def work(job):
+def work(job, source=None):
     name, url = job
     p = os.path.join(TMP, f"{os.getpid()}.part")
     for attempt in range(6):
@@ -542,7 +595,7 @@ def work(job):
         buf = io.StringIO()
         w = csv.writer(buf, lineterminator="\n")
         n = 0
-        for r in rows_of(p, name):
+        for r in rows_of(p, name, 0, source):
             w.writerow([r[k] for k in FIELDS])
             n += 1
         return name, gzip.compress(buf.getvalue().encode(), 6), size, n
@@ -570,9 +623,10 @@ def num(s):
 
 
 def read(state):
-    """(epsg, rows) of a state, a chunk at a time: (x, y, code, height, roof height)."""
+    """(epsg, rows) of a state, a chunk at a time: (x, y, code, height, roof height, ridge: the grid azimuth, nan
+    none)."""
     out = {}
-    for x, y, epsg, area, roof, height, z0, zr, zt, ridge, part in rows(state):
+    for x, y, epsg, area, roof, height, z0, zr, zt, ridge_az, part in rows(state):
         try:
             code = int(roof) if roof else 0
         except ValueError:
@@ -585,7 +639,7 @@ def read(state):
         if not 0.5 < h < 400:
             continue
         v = out.setdefault(int(epsg or 0), [])
-        v.append((float(x), float(y), code, h, rh))
+        v.append((float(x), float(y), code, h, rh, num(ridge_az)))
         if len(v) >= CHUNK:
             yield int(epsg or 0), v
             out[int(epsg or 0)] = []
@@ -598,11 +652,35 @@ def tiles(lat, lon):
     return ((lon + 180) / 360 * n).astype(np.int32), ((1 - np.arcsinh(np.tan(r)) / math.pi) / 2 * n).astype(np.int32)
 
 
+def lonlat(epsg, x, y):
+    """(lon, lat) degrees of grid points: EPSG:2180 through server/pl1992 (the project's Polish coordinates), the others
+    through pyproj."""
+    if epsg == 2180:
+        return pl1992.to_lonlat(x, y)
+    return Transformer.from_crs(epsg, 4326, always_xy=True).transform(x, y)
+
+
+def true_azimuth(epsg, x, y, az, lon, lat):
+    """The ridge azimuth az (degrees clockwise from the grid's north at x, y) turned to true north, 0..179 (nan where
+    az is nan): a second point 10 m along the ridge is transformed too, so any CRS's meridian convergence is in it (for
+    EPSG:2180 about (lon - 19) * sin(lat): up to 2.5 degrees at the eastern border)."""
+    r = np.radians(az)
+    lon2, lat2 = lonlat(epsg, x + 10.0 * np.sin(r), y + 10.0 * np.cos(r))
+    t = np.degrees(np.arctan2((np.asarray(lon2) - lon) * np.cos(np.radians(lat)), np.asarray(lat2) - lat))
+    return t % 180.0
+
+
 def spool(tmp, epsg, v):
     """Rows onto the end of their tiles' files: a country does not have to fit in memory."""
     a = np.array(v, np.float64)
-    lon, lat = Transformer.from_crs(epsg, 4326, always_xy=True).transform(a[:, 0], a[:, 1])
+    lon, lat = lonlat(epsg, a[:, 0], a[:, 1])
+    lon, lat = np.asarray(lon, np.float64), np.asarray(lat, np.float64)
     r = np.empty(len(a), RECORD)
+    has = np.isfinite(a[:, 5])
+    r["ridge"] = NO_RIDGE
+    if has.any():
+        t = true_azimuth(epsg, a[has, 0], a[has, 1], a[has, 5], lon[has], lat[has])
+        r["ridge"][has] = np.round(t).astype(np.int64) % 180
     r["lat"], r["lon"] = np.round(lat * 1e6), np.round(lon * 1e6)
     r["code"], r["height"] = a[:, 2], np.round(a[:, 3] * 10)
     r["roof"] = np.round(np.minimum(a[:, 4], 200) * 10)
@@ -656,7 +734,8 @@ def fetch(state, workers=2):
     t0, got, rows_n, errs = time.time(), 0, 0, 0
     with mp.Pool(workers, initializer=low) as pool, open(os.path.join(OUT, state + ".csv.gz"), "ab") as out, \
             open(done_p, "a", encoding="utf-8") as dl, open(os.path.join(OUT, state + ".err"), "a", encoding="utf-8") as el:
-        for i, (name, blob, size, res) in enumerate(pool.imap_unordered(work, todo), 1):
+        job = functools.partial(work, source=state)
+        for i, (name, blob, size, res) in enumerate(pool.imap_unordered(job, todo), 1):
             if blob is not None:
                 out.write(blob)
                 out.flush()
